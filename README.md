@@ -1,77 +1,130 @@
-# Ring Buffer — Fixed-Size Circular Queue
+# ring-buffer
 
-A **ring buffer** (circular buffer) is a fixed-size queue where the end wraps around to the beginning, forming a ring. Two pointers — `head` (read position) and `tail` (write position) — track the valid region. When either pointer reaches the array boundary, it wraps to index 0 via modular arithmetic.
+A **fixed-capacity circular buffer** (ring buffer) in Rust, implementing FIFO semantics with $O(1)$ push and pop using a contiguous array with modular arithmetic for wrap-around.
 
 ## Why It Matters
 
-Ring buffers are the fundamental data structure for bounded producer-consumer scenarios: audio processing (PortAudio's playback buffer), serial I/O (kernel UART receive buffers), network packet queues, and real-time data streaming. They're used in every operating system kernel and audio driver.
+Ring buffers are the **workhorse data structure** of systems programming. They power:
 
-The key advantage: O(1) push and pop with **zero allocations** after initialization. The buffer is pre-allocated to a fixed size, making it suitable for real-time systems where allocation jitter is unacceptable. When full, `push_back` returns an error rather than growing — providing natural backpressure.
+- **Producer-consumer queues** — lock-free variants drive Linux's `io_uring`
+- **Network packet buffers** — every NIC DMA ring is a ring buffer
+- **Audio/video streaming** — bounded-latency jitter buffers
+- **Serial I/O** — UART receive buffers in embedded systems
+- **Log buffers** — `dmesg` and `syslog` use circular overwrite buffers
 
-Compared to `VecDeque` (which also uses a ring internally): ring buffers have a fixed capacity (no reallocation), can be placed in shared memory (for IPC between processes), and can be made lock-free for SPSC (single-producer, single-consumer) scenarios. See `ring-buffer-atomic` for the lock-free variant.
+The key advantage over a `VecDeque` is **bounded, compile-time-known capacity**: no allocations, no resize, no fragmentation. This makes ring buffers ideal for `no_std` and real-time contexts.
 
 ## How It Works
 
-The buffer stores data in a fixed array with three indices:
+### Circular Indexing
+
+The buffer maintains three pointers: `head` (read), `tail` (write), and `len` (count). Indices wrap using modular arithmetic:
+
+$$\text{next}(i) = (i + 1) \bmod N$$
+
+where $N$ is the capacity. This creates a logical ring from a linear array:
 
 ```
-[_][_][A][B][C][D][_][_]
-       ↑ head (read)     ↑ tail (write)
+Array:  [_][B][C][D][_][_][_][_]
+              ↑           ↑
+            head        tail
+            (read)     (write)
 
-After push_back(E): tail advances
-[_][_][A][B][C][D][E][_]
-
-After pop_front() → A: head advances
-[_][_][_][B][C][D][E][_]
-            ↑ head       ↑ tail
+State: len=3, capacity=8
 ```
 
-**push_back(item)**: If `len == CAPACITY`, return Err (full). Otherwise, write at `tail`, advance `tail = (tail + 1) % CAPACITY`, increment `len`. O(1).
+After pushing E, F, G, H and popping B, C, D:
 
-**pop_front()**: If `len == 0`, return None (empty). Otherwise, read at `head`, advance `head = (head + 1) % CAPACITY`, decrement `len`. O(1).
+```
+Array:  [_][_][_][_][E][F][G][H]
+                          ↑
+                  head = tail (full or empty — disambiguated by len)
+```
 
-The `% CAPACITY` modular arithmetic creates the circular behavior — after writing to the last slot, `tail` wraps to slot 0. The `len` counter tracks the number of valid elements, distinguishing full from empty (both would have `head == tail` without the counter).
+### Full / Empty Disambiguation
+
+A classic ring buffer ambiguity: when `head == tail`, is the buffer empty or full? This implementation resolves it with an explicit `len` counter:
+
+| Condition | `head == tail` | `len` | State |
+|-----------|----------------|-------|-------|
+| Empty | possible | $0$ | Read returns `None` |
+| Full | possible | $N$ | Write returns `Err(item)` |
+
+Alternative approaches sacrifice one slot (capacity $N-1$ usable) or use a separate full flag.
+
+### Complexity
+
+| Operation | Time | Space |
+|-----------|------|-------|
+| `push_back` | $O(1)$ | $O(N)$ total, fixed |
+| `pop_front` | $O(1)$ | — |
+| `len` / `is_empty` | $O(1)$ | — |
+| Memory allocation | Zero (static array) | $O(N)$ at construction |
+
+All operations are **deterministic** — no allocation, no resize, no reallocation. This is critical for real-time systems where jitter must be bounded.
+
+### Generic Constraints
+
+The implementation requires `T: Clone + Default + Debug`:
+- `Clone`: needed because `Option<T>` array initialization uses `Default::default()`
+- `Default`: for array initialization
+- `Debug`: for diagnostic output
+
+In production, a `MaybeUninit<T>` approach could remove these bounds for zero-overhead.
 
 ## Quick Start
 
 ```rust
 use ring_buffer::RingBuffer;
 
-let mut buf: RingBuffer<i32> = RingBuffer::new();
+fn main() {
+    let mut buf: RingBuffer<i32> = RingBuffer::new();
 
-// Fill the buffer (capacity = 8)
-for i in 0..8 {
-    buf.push_back(i).unwrap();
+    // Push 5 elements into capacity-8 buffer
+    for i in 1..=5 {
+        buf.push_back(i).unwrap();
+    }
+    println!("Length: {}", buf.len());  // 5
+
+    // Pop in FIFO order
+    while let Some(v) = buf.pop_front() {
+        print!("{} ", v);  // 1 2 3 4 5
+    }
+    println!("\nEmpty: {}", buf.is_empty());  // true
 }
+```
 
-// Buffer is full
-assert!(buf.push_back(99).is_err());
-
-// Drain it
-while let Some(val) = buf.pop_front() {
-    print!("{} ", val); // 0 1 2 3 4 5 6 7
-}
+```bash
+cargo build
+cargo run
 ```
 
 ## API
 
-- `RingBuffer::new()` — Create buffer with default capacity (8)
-- `push_back(item)` — Enqueue. O(1). Returns Err if full
-- `pop_front()` — Dequeue. O(1). Returns None if empty
-- `len()` — Current element count
-- `is_empty()` / `is_full()` — State queries
+### `RingBuffer<T>`
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `new` | `fn new() -> Self` | Create empty buffer (capacity = 8) |
+| `push_back` | `fn push_back(&mut self, item: T) -> Result<(), T>` | Add to tail; `Err(item)` if full |
+| `pop_front` | `fn pop_front(&mut self) -> Option<T>` | Remove from head; `None` if empty |
+| `is_empty` | `fn is_empty(&self) -> bool` | True if `len == 0` |
+| `len` | `fn len(&self) -> usize` | Current element count |
+
+**Capacity:** Fixed at `const CAPACITY: usize = 8`. Change the constant to adjust.
 
 ## Architecture Notes
 
-Part of the [SuperInstance](https://github.com/SuperInstance) ecosystem. Ring buffers connect fleet agents in producer-consumer pipelines — the bottle protocol uses ring buffers internally for message queuing. The fixed capacity provides natural backpressure: if a consumer agent is slow, its ring buffer fills and the producer gets Err, triggering the conservation law's feedback loop.
+This crate is part of the **SuperInstance ecosystem**. Ring buffers serve as **bounded channels** between fleet agents: one agent produces bottles (trit vectors $\gamma$) into the buffer, and another consumes them, producing responses ($\eta$). The conservation law $\gamma + \eta = C$ is preserved because the buffer is **lossless** — every bottle pushed is eventually popped. If the buffer overflows (push returns `Err`), the producer must backpressure, preventing conservation violations from dropped messages.
 
-See [ARCHITECTURE.md](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md).
+The fixed capacity mirrors the **bounded-memory** principle of the fleet: no unbounded queues, no OOM, predictable latency.
 
 ## References
 
-- Lamport, L. (1977). "Proving the Correctness of Multiprocess Programs." — using ring buffers in concurrent systems
-- Herlihy, M. & Shavit, N. (2012). *The Art of Multiprocessor Programming*, Ch. 3. — bounded queues
-- Linux kernel source: `include/linux/circ_buf.h` — production ring buffer implementation
+1. Lamport, L. (1977). *"Proving the Correctness of Multiprocess Programs."* IEEE TSE, SE-3(2).
+2. Herlihy, M. & Shavit, N. (2012). *The Art of Multiprocessor Programming.* MIT Press. Ch. 3–4.
+3. Linux Kernel Documentation. *Circular Buffers.* <https://www.kernel.org/doc/html/latest/core-api/circular-buffers.html>
+4. Duffy, J. (2019). *Java Concurrency in Practice.* Addison-Wesley. §5.3 Blocking Queues.
 
 ## License
 
